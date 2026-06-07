@@ -1207,41 +1207,133 @@ def check_pdf_document(filepath: str, config: Config, temp_dir: Optional[str] = 
     if not is_text_scan_allowed and not is_ocr_scan_allowed:
         return results
 
+    pdf = None
     try:
-        with pdfplumber.open(filepath) as pdf:
-            max_text_pages = config.get('pdf_text_page_limit', 10) if is_text_scan_allowed else 0
-            max_ocr_pages = config.get('pdf_ocr_page_limit', 5) if is_ocr_scan_allowed else 0
-            max_pages_to_process = max(max_text_pages, max_ocr_pages)
+        # Попытка открыть PDF с обработкой различных типов ошибок
+        try:
+            pdf = pdfplumber.open(filepath)
+        except Exception as pdf_open_error:
+            if "No /Root object" in str(pdf_open_error) or "trailer not found" in str(pdf_open_error):
+                logger.warning(f"Пропущен невалидный PDF-файл: {os.path.basename(filepath)}")
+            else:
+                logger.error(f"Ошибка открытия PDF {os.path.basename(filepath)}: {pdf_open_error}")
+            return results
 
-            for i, page in enumerate(pdf.pages[:max_pages_to_process]):
-                if stop_event and stop_event.is_set():
-                    break
+        if not hasattr(pdf, 'pages') or not pdf.pages:
+            logger.warning(f"PDF файл не содержит страниц или повреждён: {os.path.basename(filepath)}")
+            return results
 
-                if is_text_scan_allowed and i < max_text_pages:
+        max_text_pages = config.get('pdf_text_page_limit', 10) if is_text_scan_allowed else 0
+        max_ocr_pages = config.get('pdf_ocr_page_limit', 5) if is_ocr_scan_allowed else 0
+        max_pages_to_process = max(max_text_pages, max_ocr_pages)
+
+        # Безопасное получение количества страниц
+        try:
+            total_pages = len(pdf.pages)
+        except Exception as e:
+            logger.warning(f"Не удалось получить количество страниц в PDF: {e}")
+            total_pages = max_pages_to_process
+
+        pages_to_process = min(max_pages_to_process, total_pages)
+
+        for i in range(pages_to_process):
+            if stop_event and stop_event.is_set():
+                logger.info(f"Сканирование PDF {os.path.basename(filepath)} остановлено пользователем на странице {i+1}")
+                break
+
+            page = None
+            pil_image = None
+            try:
+                page = pdf.pages[i]
+            except (IndexError, KeyError) as page_error:
+                logger.debug(f"Не удалось получить страницу {i+1} из PDF: {page_error}")
+                continue
+            except Exception as page_error:
+                logger.error(f"Ошибка доступа к странице {i+1} PDF: {page_error}")
+                continue
+
+            # Обработка текста
+            if is_text_scan_allowed and i < max_text_pages:
+                try:
+                    text = page.extract_text(x_tolerance=3) or ""
+                    if text.strip():
+                        found = search_grifs_in_text(text, config.text_grifs_regex)
+                        if found:
+                            results['text_grifs'].update(found)
+                except Exception as text_error:
+                    logger.warning(f"Ошибка извлечения текста со страницы {i+1} PDF: {text_error}")
+
+            # Обработка OCR
+            if is_ocr_scan_allowed and i < max_ocr_pages:
+                try:
+                    # Безопасное преобразование страницы в изображение
                     try:
-                        text = page.extract_text(x_tolerance=3) or ""
-                        if text.strip():
-                            results['text_grifs'].update(search_grifs_in_text(text, config.text_grifs_regex))
-                    except Exception as e:
-                        logger.warning(f"Ошибка извлечения текста (pdfplumber) на стр. {i+1}: {e}")
+                        img_obj = page.to_image(resolution=config.get('ocr_resolution', 300))
+                        
+                        # Получение PIL Image в зависимости от версии pdfplumber
+                        if hasattr(img_obj, 'original'):
+                            pil_image = img_obj.original
+                        elif hasattr(img_obj, 'convert'):
+                            pil_image = img_obj.convert("RGB")
+                        else:
+                            pil_image = img_obj
+                            
+                    except AttributeError as attr_error:
+                        logger.warning(f"Ошибка атрибута при конвертации страницы {i+1}: {attr_error}")
+                        continue
+                    except MemoryError as mem_error:
+                        logger.error(f"Недостаточно памяти при обработке страницы {i+1} PDF: {mem_error}")
+                        gc.collect()
+                        continue
 
-                if is_ocr_scan_allowed and i < max_ocr_pages:
+                    if pil_image is None:
+                        logger.warning(f"Не удалось получить изображение со страницы {i+1}")
+                        continue
+
                     try:
-                        pil_image = page.to_image(resolution=config.get('ocr_resolution', 300)).original
                         found_ocr = ocr_image(pil_image, config)
                         if found_ocr:
                             results['ocr_grifs'].update(found_ocr)
-                    except Exception as e:
-                        if "access violation" in str(e) or "0xc0000005" in str(e):
-                            logger.error(f"Критический сбой Tesseract OCR на стр. {i+1} PDF {os.path.basename(filepath)}: {e}")
+                    except Exception as ocr_error:
+                        if "access violation" in str(ocr_error) or "0xc0000005" in str(ocr_error):
+                            logger.error(f"Критический сбой Tesseract OCR на стр. {i+1} PDF {os.path.basename(filepath)}: {ocr_error}")
                         else:
-                            logger.error(f"Ошибка OCR на стр. {i+1} PDF {os.path.basename(filepath)}: {e}")
+                            logger.error(f"Ошибка OCR на стр. {i+1} PDF {os.path.basename(filepath)}: {ocr_error}")
+                    finally:
+                        # Очистка памяти после OCR
+                        try:
+                            if hasattr(pil_image, 'close'):
+                                pil_image.close()
+                        except Exception:
+                            pass
+                        finally:
+                            pil_image = None
+                            gc.collect()
+
+                except Exception as ocr_outer_error:
+                    logger.error(f"Неожиданная ошибка OCR на странице {i+1}: {ocr_outer_error}")
+                    continue
+
+            # Периодическая очистка памяти
+            if (i + 1) % 5 == 0:
+                gc.collect()
+
+        return results
+
     except Exception as e:
-        if "No /Root object" in str(e) or "trailer not found" in str(e):
-            logger.warning(f"Пропущен невалидный PDF-файл: {os.path.basename(filepath)}")
-        else:
-            logger.error(f"Критическая ошибка обработки PDF {os.path.basename(filepath)}: {e}")
-    return results
+        logger.error(f"Критическая ошибка при обработке PDF {os.path.basename(filepath)}: {e}", exc_info=True)
+        return results
+
+    finally:
+        # Закрытие PDF
+        try:
+            if pdf is not None:
+                pdf.close()
+        except Exception as close_error:
+            logger.debug(f"Ошибка при закрытии PDF: {close_error}")
+        finally:
+            pdf = None
+            gc.collect()
 
 
 def safe_extract(zip_ref, member, path):
